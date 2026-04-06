@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { Loader2, MessageCircle, Mic, Send, X } from 'lucide-react';
 import axios from 'axios';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import rehypeSanitize from 'rehype-sanitize';
 
 interface Message {
   role: 'user' | 'bot';
@@ -16,6 +19,44 @@ const FLOATING_BOT_IMAGE_URL = import.meta.env.VITE_FLOATING_BOT_IMAGE_URL || ''
 const SESSION_STORAGE_KEY = 'vtl_session_id';
 const EMAIL_STORAGE_KEY = 'vtl_lead_email';
 const NAME_STORAGE_KEY = 'vtl_lead_name';
+const DEFAULT_SUGGESTED_QUESTIONS = [
+  'What services does Desire Infoweb provide?',
+  'What is Desire Infoweb?',
+  'What type of AI solutions does Desire create?',
+];
+
+const normalizeQuestionText = (value: string): string => {
+  return value.trim().toLowerCase().replace(/\s+/g, ' ');
+};
+
+const decodeHeaderValue = (value: string | null): string => {
+  if (!value) {
+    return '';
+  }
+
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+};
+
+const normalizeMarkdownText = (text: string): string => {
+  const normalized = (text || '').replace(/\r\n?/g, '\n');
+  const fenceCount = (normalized.match(/(^|\n)```/g) || []).length;
+  if (fenceCount % 2 === 1) {
+    return `${normalized}\n\n\`\`\``;
+  }
+  return normalized;
+};
+
+function MarkdownMessage({ text }: { text: string }) {
+  return (
+    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeSanitize]} className="vtl-markdown">
+      {normalizeMarkdownText(text)}
+    </ReactMarkdown>
+  );
+}
 
 const isValidEmail = (email: string): boolean => {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
@@ -40,6 +81,7 @@ function App() {
   const [leadEmail, setLeadEmail] = useState('');
   const [leadName, setLeadName] = useState('');
   const [leadStage, setLeadStage] = useState<LeadStage>('email');
+  const [dynamicSuggestedQuestions, setDynamicSuggestedQuestions] = useState<string[]>([]);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
@@ -103,15 +145,48 @@ function App() {
     }
   }, [messages, isLoading]);
 
-  const handleTextSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!inputText.trim()) {
+  const refreshSuggestedQuestions = async (targetSessionId: string = sessionId) => {
+    if (!targetSessionId) {
       return;
     }
 
-    const userMsg = inputText.trim();
+    try {
+      const response = await axios.get(`${API_BASE_URL}/api/chat/suggestions`, {
+        params: {
+          session_id: targetSessionId,
+          limit: 6,
+        },
+      });
+
+      const starterKeys = new Set(DEFAULT_SUGGESTED_QUESTIONS.map(normalizeQuestionText));
+      const nextSuggestions = Array.isArray(response.data?.suggestions)
+        ? response.data.suggestions
+          .filter((item: unknown): item is string => typeof item === 'string' && item.trim().length > 0)
+          .filter((item: string) => !starterKeys.has(normalizeQuestionText(item)))
+          .slice(0, 3)
+        : [];
+
+      setDynamicSuggestedQuestions(nextSuggestions);
+    } catch {
+      setDynamicSuggestedQuestions([]);
+    }
+  };
+
+  const visibleSuggestedQuestions = [...DEFAULT_SUGGESTED_QUESTIONS, ...dynamicSuggestedQuestions];
+
+  useEffect(() => {
+    if (leadStage === 'chat' && sessionId) {
+      void refreshSuggestedQuestions(sessionId);
+    }
+  }, [leadStage, sessionId]);
+
+  const submitUserMessage = async (rawMessage: string) => {
+    if (!rawMessage.trim()) {
+      return;
+    }
+
+    const userMsg = rawMessage.trim();
     setMessages((prev) => [...prev, { role: 'user', text: userMsg }]);
-    setInputText('');
 
     if (leadStage === 'email') {
       if (!isValidEmail(userMsg)) {
@@ -173,11 +248,31 @@ function App() {
       formData.append('lead_name', leadName);
       const response = await axios.post(`${API_BASE_URL}/api/chat/text`, formData);
       setMessages((prev) => [...prev, { role: 'bot', text: response.data.reply }]);
+      void refreshSuggestedQuestions(response.data.session_id || sessionId);
     } catch {
       setMessages((prev) => [...prev, { role: 'bot', text: 'Sorry, an error occurred.' }]);
     } finally {
       setIsLoading(false);
     }
+  };
+
+  const handleTextSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!inputText.trim()) {
+      return;
+    }
+
+    const messageToSend = inputText;
+    setInputText('');
+    await submitUserMessage(messageToSend);
+  };
+
+  const handleSuggestedQuestionClick = async (question: string) => {
+    if (leadStage !== 'chat' || isLoading || isRecording) {
+      return;
+    }
+
+    await submitUserMessage(question);
   };
 
   const startRecording = async () => {
@@ -236,14 +331,29 @@ function App() {
         throw new Error('Voice API failed');
       }
 
-      const userQuery = response.headers.get('X-User-Query') || 'Voice Message';
-      const botReply = response.headers.get('X-Bot-Reply') || 'Audio Reply';
+      let userQuery = decodeHeaderValue(response.headers.get('X-User-Query-Encoded'))
+        || response.headers.get('X-User-Query')
+        || 'Voice Message';
+      let botReply = decodeHeaderValue(response.headers.get('X-Bot-Reply-Encoded'))
+        || response.headers.get('X-Bot-Reply')
+        || 'Audio Reply';
+
+      try {
+        const lastTurnResponse = await axios.get(`${API_BASE_URL}/api/chat/last`, {
+          params: { session_id: sessionId },
+        });
+        userQuery = lastTurnResponse.data.user_query || userQuery;
+        botReply = lastTurnResponse.data.reply || botReply;
+      } catch {
+        // Keep header-based fallbacks when last-turn lookup is unavailable.
+      }
 
       setMessages((prev) => [
         ...prev,
         { role: 'user', text: userQuery, isAudio: true },
         { role: 'bot', text: botReply, isAudio: true },
       ]);
+      void refreshSuggestedQuestions(sessionId);
 
       const audioResponseBlob = await response.blob();
       const audioUrl = URL.createObjectURL(audioResponseBlob);
@@ -309,7 +419,11 @@ function App() {
                   }`}
                 >
                   {msg.isAudio && <span className="text-xs opacity-75 block mb-1">🎤 Voice</span>}
-                  {msg.text}
+                  {msg.role === 'bot' ? (
+                    <MarkdownMessage text={msg.text} />
+                  ) : (
+                    <span className="whitespace-pre-wrap break-words">{msg.text}</span>
+                  )}
                 </div>
               </div>
             ))}
@@ -325,6 +439,25 @@ function App() {
           </div>
 
           <div className="p-3 bg-white border-t">
+            {leadStage === 'chat' && (
+              <div className="mb-3">
+                <div className="text-xs text-gray-500 mb-2">Suggested questions</div>
+                <div className="flex flex-wrap gap-2">
+                  {visibleSuggestedQuestions.map((question) => (
+                    <button
+                      key={question}
+                      type="button"
+                      onClick={() => void handleSuggestedQuestionClick(question)}
+                      disabled={isLoading || isRecording}
+                      className="px-3 py-1.5 rounded-full text-xs bg-gray-100 text-gray-700 hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {question}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
             <div className={`text-xs mb-2 ${isRecording ? 'text-red-500 font-medium' : 'text-gray-500'}`}>
               {voiceHintText}
             </div>

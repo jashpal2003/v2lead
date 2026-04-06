@@ -10,9 +10,9 @@ from pathlib import Path
 from threading import Lock
 from time import sleep
 from time import time
+from urllib.parse import quote
 
 import edge_tts
-import google.generativeai as genai
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
@@ -23,7 +23,8 @@ from ingestion import ingest_file
 from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+from openai import AzureOpenAI
 from langchain_pinecone import PineconeVectorStore
 from pinecone import Pinecone, ServerlessSpec
 from pinecone.core.client.exceptions import NotFoundException
@@ -39,7 +40,13 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-User-Query", "X-Bot-Reply"],
+    expose_headers=[
+        "X-Session-Id",
+        "X-User-Query",
+        "X-Bot-Reply",
+        "X-User-Query-Encoded",
+        "X-Bot-Reply-Encoded",
+    ],
 )
 
 SUPPORTED_INGEST_EXTENSIONS = {".pdf", ".txt", ".md", ".csv", ".log"}
@@ -92,6 +99,12 @@ INDUSTRY_SUMMARY = (
     "real estate, travel, healthcare, and logistics/distribution."
 )
 
+DEFAULT_FOLLOWUP_QUESTIONS = [
+    "What services does Desire Infoweb provide?",
+    "What is Desire Infoweb?",
+    "What type of AI solutions does Desire create?",
+]
+
 _conversation_lock = Lock()
 _conversation_store: dict[str, deque[tuple[str, str]]] = {}
 _lead_lock = Lock()
@@ -107,9 +120,16 @@ def _get_required_env(name: str) -> str:
     return value
 
 
-def _sanitize_header_value(value: str) -> str:
+def _sanitize_header_value(value: str, *, max_chars: int = 700) -> str:
     normalized = value.replace("\r", " ").replace("\n", " ").strip()
+    normalized = normalized[:max_chars]
     return normalized.encode("latin1", "ignore").decode("latin1")
+
+
+def _encode_header_value(value: str, *, max_chars: int = 2500) -> str:
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+    normalized = normalized[:max_chars]
+    return quote(normalized, safe="")
 
 
 def _normalize_user_query(query: str) -> str:
@@ -176,6 +196,96 @@ def _build_conversation_transcript(session_id: str) -> str:
         lines.append(f"Assistant: {assistant_text}")
 
     return "\n".join(lines)
+
+
+def _get_last_conversation_turn(session_id: str) -> tuple[str, str] | None:
+    with _conversation_lock:
+        history = _conversation_store.get(session_id)
+        if not history:
+            return None
+        return history[-1]
+
+
+def _normalize_question_for_compare(question: str) -> str:
+    return re.sub(r"\W+", "", question).lower()
+
+
+def _build_dynamic_followup_questions(session_id: str, limit: int = 3) -> list[str]:
+    with _conversation_lock:
+        history = list(_conversation_store.get(session_id, []))
+
+    if not history:
+        return DEFAULT_FOLLOWUP_QUESTIONS[:limit]
+
+    user_questions = { _normalize_question_for_compare(user_text) for user_text, _ in history }
+    combined_context = "\n".join(
+        f"{user_text}\n{assistant_text}" for user_text, assistant_text in history[-4:]
+    ).lower()
+
+    topic_rules: list[tuple[tuple[str, ...], str]] = [
+        (
+            ("service", "sharepoint", "power apps", "power automate", "power bi", "dynamics"),
+            "Can you share similar projects you've delivered in these services?",
+        ),
+        (
+            ("ai", "chatbot", "copilot", "automation", "openai"),
+            "How would you design an AI solution for my specific business use case?",
+        ),
+        (
+            ("budget", "cost", "price", "pricing", "estimate", "quotation", "quote"),
+            "What details do you need from me to prepare an accurate estimate?",
+        ),
+        (
+            ("timeline", "delivery", "duration", "deadline", "time"),
+            "What is a realistic timeline for this type of implementation?",
+        ),
+        (
+            ("industry", "domain", "sector", "retail", "healthcare", "finance", "education"),
+            "Have you implemented this for companies in my industry?",
+        ),
+        (
+            ("teams", "website", "whatsapp", "integration", "channel"),
+            "Which deployment channel would you recommend for best user adoption?",
+        ),
+        (
+            ("data", "sharepoint", "blob", "document", "knowledge", "pdf"),
+            "How do you keep chatbot knowledge secure and up to date over time?",
+        ),
+        (
+            ("support", "maintenance", "sla", "post-launch"),
+            "What post-launch support and maintenance model do you provide?",
+        ),
+    ]
+
+    suggestions: list[str] = []
+    seen = set()
+
+    for keywords, suggestion in topic_rules:
+        if any(keyword in combined_context for keyword in keywords):
+            key = _normalize_question_for_compare(suggestion)
+            if key in seen or key in user_questions:
+                continue
+            suggestions.append(suggestion)
+            seen.add(key)
+        if len(suggestions) >= limit:
+            return suggestions
+
+    fallback_questions = [
+        "Would you like a step-by-step implementation plan for your requirement?",
+        "Should I suggest the best engagement model for your project scope?",
+        *DEFAULT_FOLLOWUP_QUESTIONS,
+    ]
+
+    for question in fallback_questions:
+        key = _normalize_question_for_compare(question)
+        if key in seen or key in user_questions:
+            continue
+        suggestions.append(question)
+        seen.add(key)
+        if len(suggestions) >= limit:
+            break
+
+    return suggestions[:limit]
 
 
 def _is_sharepoint_sync_enabled() -> bool:
@@ -408,19 +518,23 @@ def _direct_company_answer(query: str) -> str | None:
 
 
 def _get_embedding_model() -> str:
-    configured_model = os.getenv("GOOGLE_EMBEDDING_MODEL")
-    if configured_model:
-        return configured_model
-
-    return _detect_embedding_model()
+    return _get_required_env("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
 
 
 def _get_chat_model() -> str:
-    configured_model = os.getenv("GOOGLE_CHAT_MODEL")
-    if configured_model:
-        return configured_model
+    return _get_required_env("AZURE_OPENAI_CHAT_DEPLOYMENT")
 
-    return _detect_chat_model()
+
+def _get_azure_openai_endpoint() -> str:
+    return _get_required_env("AZURE_OPENAI_ENDPOINT")
+
+
+def _get_azure_openai_api_key() -> str:
+    return _get_required_env("AZURE_OPENAI_API_KEY")
+
+
+def _get_azure_openai_api_version() -> str:
+    return os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
 
 
 def _get_transcription_model() -> str:
@@ -432,7 +546,32 @@ def _get_tts_voice() -> str:
 
 
 def _get_max_output_tokens() -> int:
-    return int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "4024"))
+    requested_raw = os.getenv("LLM_MAX_OUTPUT_TOKENS", "1200")
+    model_cap_raw = os.getenv("AZURE_OPENAI_MAX_COMPLETION_TOKENS", "16384")
+
+    try:
+        requested_tokens = int(requested_raw)
+    except ValueError:
+        requested_tokens = 1200
+
+    try:
+        model_cap = int(model_cap_raw)
+    except ValueError:
+        model_cap = 16384
+
+    bounded_tokens = max(64, min(requested_tokens, model_cap))
+    if bounded_tokens != requested_tokens:
+        logger.warning(
+            "LLM_MAX_OUTPUT_TOKENS=%s exceeds allowed range; using %s instead.",
+            requested_tokens,
+            bounded_tokens,
+        )
+
+    return bounded_tokens
+
+
+def _get_llm_temperature() -> float:
+    return float(os.getenv("AZURE_OPENAI_TEMPERATURE", "0.1"))
 
 
 def _get_memory_turns() -> int:
@@ -466,60 +605,6 @@ def _save_conversation_turn(session_id: str, user_text: str, assistant_text: str
         _conversation_store[session_id].append((user_text, assistant_text))
 
 
-@lru_cache(maxsize=1)
-def _detect_embedding_model() -> str:
-    genai.configure(api_key=_get_required_env("GOOGLE_API_KEY"))
-
-    available_models: list[str] = []
-    for model in genai.list_models():
-        methods = set(getattr(model, "supported_generation_methods", []) or [])
-        if "embedContent" in methods:
-            model_name = getattr(model, "name", "")
-            if model_name:
-                available_models.append(model_name)
-
-    if not available_models:
-        raise ValueError(
-            "No Google embedding models are available for this API key. "
-            "Set GOOGLE_EMBEDDING_MODEL explicitly to a supported model."
-        )
-
-    preferred_suffixes = ["text-embedding-004", "embedding-001", "text-embedding-005"]
-    for suffix in preferred_suffixes:
-        for model_name in available_models:
-            if model_name.endswith(suffix):
-                return model_name
-
-    return available_models[0]
-
-
-@lru_cache(maxsize=1)
-def _detect_chat_model() -> str:
-    genai.configure(api_key=_get_required_env("GOOGLE_API_KEY"))
-
-    available_models: list[str] = []
-    for model in genai.list_models():
-        methods = set(getattr(model, "supported_generation_methods", []) or [])
-        if "generateContent" in methods:
-            model_name = getattr(model, "name", "")
-            if model_name:
-                available_models.append(model_name)
-
-    if not available_models:
-        raise ValueError(
-            "No Google chat models are available for this API key. "
-            "Set GOOGLE_CHAT_MODEL explicitly to a supported model."
-        )
-
-    preferred_suffixes = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro", "gemini-pro"]
-    for suffix in preferred_suffixes:
-        for model_name in available_models:
-            if model_name.endswith(suffix):
-                return model_name
-
-    return available_models[0]
-
-
 def ensure_pinecone_index_exists() -> None:
     api_key = _get_required_env("PINECONE_API_KEY")
     index_name = _get_required_env("PINECONE_INDEX_NAME")
@@ -537,7 +622,7 @@ def ensure_pinecone_index_exists() -> None:
                 "Create it manually or set AUTO_CREATE_PINECONE_INDEX=true."
             ) from error
 
-    dimension = int(os.getenv("PINECONE_DIMENSION", "768"))
+    dimension = int(os.getenv("PINECONE_DIMENSION", "1536"))
     metric = os.getenv("PINECONE_METRIC", "cosine")
     cloud = os.getenv("PINECONE_CLOUD", "aws")
     region = os.getenv("PINECONE_REGION", "us-east-1")
@@ -585,6 +670,15 @@ prompt = ChatPromptTemplate.from_messages([
 
 
 @lru_cache(maxsize=1)
+def get_azure_openai_client() -> AzureOpenAI:
+    return AzureOpenAI(
+        api_version=_get_azure_openai_api_version(),
+        azure_endpoint=_get_azure_openai_endpoint(),
+        api_key=_get_azure_openai_api_key(),
+    )
+
+
+@lru_cache(maxsize=1)
 def get_groq_client() -> Groq:
     return Groq(api_key=_get_required_env("GROQ_API_KEY"))
 
@@ -593,13 +687,22 @@ def get_groq_client() -> Groq:
 def get_rag_chain():
     ensure_pinecone_index_exists()
 
-    llm = ChatGoogleGenerativeAI(
-        model=_get_chat_model(),
-        temperature=0.1,
-        max_output_tokens=_get_max_output_tokens(),
-        convert_system_message_to_human=True,
+    llm = AzureChatOpenAI(
+        azure_endpoint=_get_azure_openai_endpoint(),
+        api_key=_get_azure_openai_api_key(),
+        openai_api_version=_get_azure_openai_api_version(),
+        azure_deployment=_get_chat_model(),
+        temperature=_get_llm_temperature(),
+        max_tokens=_get_max_output_tokens(),
     )
-    embeddings = GoogleGenerativeAIEmbeddings(model=_get_embedding_model())
+    embedding_deployment = _get_embedding_model()
+    embeddings = AzureOpenAIEmbeddings(
+        azure_endpoint=_get_azure_openai_endpoint(),
+        api_key=_get_azure_openai_api_key(),
+        openai_api_version=_get_azure_openai_api_version(),
+        azure_deployment=embedding_deployment,
+        model=embedding_deployment,
+    )
     vectorstore = PineconeVectorStore(
         index_name=_get_required_env("PINECONE_INDEX_NAME"),
         embedding=embeddings,
@@ -607,6 +710,26 @@ def get_rag_chain():
     retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
     question_answer_chain = create_stuff_documents_chain(llm, prompt)
     return create_retrieval_chain(retriever, question_answer_chain)
+
+
+def _generate_answer(model_input: str, normalized_query: str) -> str:
+    direct_answer = _direct_company_answer(normalized_query)
+
+    try:
+        rag_chain = get_rag_chain()
+        response = rag_chain.invoke({"input": model_input})
+        answer = str(response.get("answer", "")).strip()
+        if answer:
+            return answer
+        raise ValueError("Azure OpenAI RAG chain returned an empty answer.")
+    except Exception as rag_error:
+        if direct_answer:
+            logger.warning(
+                "RAG generation failed (%s). Returning direct fallback answer.",
+                rag_error,
+            )
+            return direct_answer
+        raise
 
 
 @app.get("/health")
@@ -632,10 +755,7 @@ async def text_chat(
         )
 
         model_input = _build_model_input(effective_session_id, normalized_query)
-
-        rag_chain = get_rag_chain()
-        response = rag_chain.invoke({"input": model_input})
-        answer = response["answer"]
+        answer = _generate_answer(model_input, normalized_query)
         _save_conversation_turn(effective_session_id, normalized_query, answer)
         await _sync_sharepoint_lead_safely(effective_session_id)
 
@@ -648,11 +768,12 @@ async def text_chat(
             },
         }
     except Exception as error:
+        logger.exception("Text chat pipeline failed")
         raise HTTPException(
             status_code=500,
             detail=(
-                "RAG backend is not ready. Verify GOOGLE_API_KEY, PINECONE_API_KEY, "
-                "PINECONE_INDEX_NAME, and ensure the Pinecone index exists."
+                "Answer generation failed. Verify AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, "
+                "AZURE_OPENAI_CHAT_DEPLOYMENT, AZURE_OPENAI_EMBEDDING_DEPLOYMENT, and Pinecone settings."
             ),
         ) from error
 
@@ -746,10 +867,7 @@ async def voice_chat(
         )
 
         model_input = _build_model_input(effective_session_id, user_text)
-
-        rag_chain = get_rag_chain()
-        response = rag_chain.invoke({"input": model_input})
-        bot_reply_text = response["answer"]
+        bot_reply_text = _generate_answer(model_input, user_text)
         _save_conversation_turn(effective_session_id, user_text, bot_reply_text)
         await _sync_sharepoint_lead_safely(effective_session_id)
 
@@ -764,8 +882,11 @@ async def voice_chat(
             media_type="audio/mpeg",
             headers={
                 "Content-Disposition": "inline; filename=reply.mp3",
+                "X-Session-Id": effective_session_id,
                 "X-User-Query": _sanitize_header_value(user_text),
                 "X-Bot-Reply": _sanitize_header_value(bot_reply_text),
+                "X-User-Query-Encoded": _encode_header_value(user_text),
+                "X-Bot-Reply-Encoded": _encode_header_value(bot_reply_text),
             },
         )
     except HTTPException:
@@ -781,3 +902,37 @@ async def voice_chat(
         ) from error
     finally:
         await audio.close()
+
+
+@app.get("/api/chat/last")
+async def get_last_chat_turn(session_id: str) -> dict:
+    effective_session_id = _normalize_session_id(session_id)
+    last_turn = _get_last_conversation_turn(effective_session_id)
+    if not last_turn:
+        raise HTTPException(status_code=404, detail="No conversation found for session_id")
+
+    with _lead_lock:
+        lead_data = dict(_lead_store.get(effective_session_id, {}))
+
+    user_text, bot_reply_text = last_turn
+
+    return {
+        "session_id": effective_session_id,
+        "user_query": user_text,
+        "reply": bot_reply_text,
+        "lead": {
+            "email": lead_data.get("email", ""),
+            "name": lead_data.get("name", ""),
+        },
+    }
+
+
+@app.get("/api/chat/suggestions")
+async def get_chat_suggestions(session_id: str, limit: int = 3) -> dict:
+    effective_session_id = _normalize_session_id(session_id)
+    bounded_limit = max(1, min(limit, 6))
+    suggestions = _build_dynamic_followup_questions(effective_session_id, bounded_limit)
+    return {
+        "session_id": effective_session_id,
+        "suggestions": suggestions,
+    }
